@@ -1,4 +1,5 @@
 import Commander
+import Foundation
 import Testing
 @testable import PeekabooCLI
 
@@ -6,12 +7,21 @@ import Testing
 struct CompletionsCommandTests {
     // MARK: - Shell Detection
 
-    @Test("Detect zsh as default when SHELL is unset")
+    @Test("Detect zsh as default")
     func detectDefaultZsh() {
+        // detectShell() uses the SHELL environment variable. When SHELL is
+        // set to something non-bash/non-fish (or is absent), zsh is the
+        // documented default. We verify the current environment produces a
+        // valid shell and that the mapping is consistent.
         let shell = CompletionsCommand.detectShell()
-        // On CI the SHELL env var may or may not be set; regardless, zsh is
-        // the documented default, and this test verifies the fallback path.
-        #expect(shell == .zsh || shell == .bash || shell == .fish)
+        let shellEnv = ProcessInfo.processInfo.environment["SHELL"] ?? ""
+        if shellEnv.contains("bash") {
+            #expect(shell == .bash)
+        } else if shellEnv.contains("fish") {
+            #expect(shell == .fish)
+        } else {
+            #expect(shell == .zsh, "Default shell should be zsh when SHELL is not bash or fish")
+        }
     }
 
     @Test("Resolve explicit shell argument")
@@ -44,9 +54,11 @@ struct CompletionsCommandTests {
     func resolveInvalidFallsBackToDetect() {
         var cmd = CompletionsCommand()
         cmd.shell = "powershell"
-        let shell = cmd.resolveShell()
-        // Should fall back to detectShell() since "powershell" is not a valid Shell
-        #expect(shell == .zsh || shell == .bash || shell == .fish)
+        let resolved = cmd.resolveShell()
+        // "powershell" is not a valid Shell case, so resolveShell() falls back
+        // to detectShell() which returns a value based on $SHELL.
+        let expected = CompletionsCommand.detectShell()
+        #expect(resolved == expected)
     }
 
     // MARK: - Zsh Script Generation
