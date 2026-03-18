@@ -1,470 +1,141 @@
 import Commander
 import Foundation
 
-/// Generate shell completion scripts for peekaboo.
+/// Generate shell completion scripts for `peekaboo`.
+///
+/// The generated scripts are rendered from Commander descriptor metadata so the
+/// CLI help, docs, and completion tables stay aligned. Users should normally
+/// install them with:
+///
+/// ```bash
+/// eval "$(peekaboo completions $SHELL)"
+/// ```
 @MainActor
 struct CompletionsCommand: ParsableCommand {
     static let commandDescription = CommandDescription(
         commandName: "completions",
         abstract: "Generate shell completion scripts",
         discussion: """
-        Generate shell completions for peekaboo. Auto-detects your shell from \
-        the SHELL environment variable when no argument is given.
+        Generate shell completions for peekaboo. The command accepts either a shell
+        name (`zsh`, `bash`, `fish`) or a full shell path such as `/bin/zsh`.
 
         Supported shells: zsh (default), bash, fish
 
         SETUP:
-          # Auto-detect shell (recommended)
-          eval "$(peekaboo completions)"
+          # Auto-detect the current shell (recommended)
+          eval "$(peekaboo completions $SHELL)"
 
-          # Explicit shell
+          # Explicit shell selection
           eval "$(peekaboo completions zsh)"
           eval "$(peekaboo completions bash)"
           peekaboo completions fish | source
 
         PERMANENT INSTALLATION:
-          # Zsh – add to ~/.zshrc:
-          eval "$(peekaboo completions zsh)"
+          # Zsh – add to ~/.zshrc
+          eval "$(peekaboo completions $SHELL)"
 
-          # Bash – add to ~/.bashrc or ~/.bash_profile:
+          # Bash – add to ~/.bashrc or ~/.bash_profile
           eval "$(peekaboo completions bash)"
 
-          # Fish – add to ~/.config/fish/config.fish:
+          # Fish – add to ~/.config/fish/config.fish
           peekaboo completions fish | source
-        """
+        """,
+        usageExamples: [
+            .init(
+                command: "peekaboo completions $SHELL",
+                description: "Generate a script for the current shell"
+            ),
+            .init(
+                command: "eval \"$(peekaboo completions $SHELL)\"",
+                description: "Enable completions for the current shell session"
+            ),
+            .init(
+                command: "peekaboo completions fish | source",
+                description: "Load fish completions in the current shell"
+            ),
+        ]
     )
 
-    @Argument(help: "Shell type (zsh, bash, fish). Auto-detected from $SHELL if omitted.")
+    @Argument(help: "Shell type or path (zsh, bash, fish, /bin/zsh). Auto-detected from $SHELL if omitted.")
     var shell: String?
 
     mutating func run() async throws {
-        let resolved = self.resolveShell()
-        let script = Self.generateScript(for: resolved)
+        let resolvedShell = try self.resolveShell()
+        let document = CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors())
+        let script = CompletionScriptRenderer.render(document: document, for: resolvedShell)
         print(script)
     }
+}
 
-    // MARK: - Shell Resolution
-
-    enum Shell: String {
+extension CompletionsCommand {
+    enum Shell: String, CaseIterable, Sendable {
         case zsh
         case bash
         case fish
+
+        var displayName: String { self.rawValue }
+
+        var installationSnippet: String {
+            switch self {
+            case .zsh, .bash:
+                "eval \"$(peekaboo completions \(self.rawValue))\""
+            case .fish:
+                "peekaboo completions fish | source"
+            }
+        }
+
+        var helpText: String {
+            switch self {
+            case .zsh:
+                "Generate a zsh completion script"
+            case .bash:
+                "Generate a bash completion script"
+            case .fish:
+                "Generate a fish completion script"
+            }
+        }
+
+        static func parse(_ specifier: String?) -> Shell? {
+            guard let specifier else { return nil }
+            let trimmed = specifier.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+
+            let lastPathComponent = URL(fileURLWithPath: trimmed).lastPathComponent.lowercased()
+            let normalized = if lastPathComponent.hasPrefix("-") {
+                String(lastPathComponent.dropFirst())
+            } else {
+                lastPathComponent
+            }
+
+            for shell in Self.allCases {
+                if normalized == shell.rawValue {
+                    return shell
+                }
+
+                guard normalized.hasPrefix(shell.rawValue) else { continue }
+                let suffix = normalized.dropFirst(shell.rawValue.count)
+                if suffix.allSatisfy({ $0.isNumber || $0 == "." || $0 == "-" }) {
+                    return shell
+                }
+            }
+
+            return nil
+        }
     }
 
-    func resolveShell() -> Shell {
-        if let explicit = shell?.lowercased(), let shell = Shell(rawValue: explicit) {
-            return shell
+    func resolveShell() throws -> Shell {
+        if let explicit = self.shell {
+            if let shell = Shell.parse(explicit) {
+                return shell
+            }
+            let supported = Shell.allCases.map(\.rawValue).joined(separator: ", ")
+            throw ValidationError("Unsupported shell '\(explicit)'. Supported shells: \(supported)")
         }
         return Self.detectShell()
     }
 
     static func detectShell() -> Shell {
-        guard let shellPath = ProcessInfo.processInfo.environment["SHELL"] else {
-            return .zsh
-        }
-        let shellName = (shellPath as NSString).lastPathComponent.lowercased()
-        if shellName.contains("bash") {
-            return .bash
-        }
-        if shellName.contains("fish") {
-            return .fish
-        }
-        return .zsh
-    }
-
-    // MARK: - Script Generation
-
-    static func generateScript(for shell: Shell) -> String {
-        let descriptors = CommanderRegistryBuilder.buildDescriptors()
-        switch shell {
-        case .zsh:
-            return self.generateZshScript(descriptors: descriptors)
-        case .bash:
-            return self.generateBashScript(descriptors: descriptors)
-        case .fish:
-            return self.generateFishScript(descriptors: descriptors)
-        }
-    }
-
-    // MARK: - Zsh
-
-    private static func generateZshScript(descriptors: [CommanderCommandDescriptor]) -> String {
-        var lines: [String] = []
-        lines.append("#compdef peekaboo")
-        lines.append("# Zsh completion for peekaboo – generated by `peekaboo completions zsh`")
-        lines.append("")
-
-        // Build subcommand completion functions for commands that have subcommands
-        for descriptor in descriptors where !descriptor.subcommands.isEmpty {
-            let fnName = "_peekaboo_\(descriptor.metadata.name.replacingOccurrences(of: "-", with: "_"))"
-            lines.append("\(fnName)() {")
-            lines.append("    local -a subcmds")
-            lines.append("    subcmds=(")
-            for sub in descriptor.subcommands.sorted(by: { $0.metadata.name < $1.metadata.name }) {
-                let escaped = self.escapeForShell(sub.metadata.abstract)
-                lines.append("        '\(sub.metadata.name):\(escaped)'")
-            }
-            lines.append("    )")
-            lines.append("    _describe -t subcommands 'subcommand' subcmds")
-
-            // Also add options/flags for the subcommands
-            let allFlags = self.collectZshOptions(descriptor: descriptor)
-            if !allFlags.isEmpty {
-                lines.append("    _arguments -s \\")
-                for (index, flag) in allFlags.enumerated() {
-                    let sep = index < allFlags.count - 1 ? " \\" : ""
-                    lines.append("        \(flag)\(sep)")
-                }
-            }
-            lines.append("}")
-            lines.append("")
-        }
-
-        // Main completion function
-        lines.append("_peekaboo() {")
-        lines.append("    local curcontext=\"$curcontext\" state line")
-        lines.append("    typeset -A opt_args")
-        lines.append("")
-        lines.append("    _arguments -C \\")
-        lines.append("        '1:command:->command' \\")
-        lines.append("        '*::arg:->args'")
-        lines.append("")
-        lines.append("    case $state in")
-        lines.append("    command)")
-        lines.append("        local -a commands")
-        lines.append("        commands=(")
-        for descriptor in descriptors.sorted(by: { $0.metadata.name < $1.metadata.name }) {
-            let escaped = self.escapeForShell(descriptor.metadata.abstract)
-            lines.append("            '\(descriptor.metadata.name):\(escaped)'")
-        }
-        lines.append("        )")
-        lines.append("        _describe -t commands 'peekaboo command' commands")
-        lines.append("        ;;")
-        lines.append("    args)")
-        lines.append("        case $line[1] in")
-        for descriptor in descriptors.sorted(by: { $0.metadata.name < $1.metadata.name }) {
-            lines.append("        \(descriptor.metadata.name))")
-            if !descriptor.subcommands.isEmpty {
-                let fnName = "_peekaboo_\(descriptor.metadata.name.replacingOccurrences(of: "-", with: "_"))"
-                lines.append("            \(fnName)")
-            } else {
-                let opts = self.collectZshOptions(descriptor: descriptor)
-                if opts.isEmpty {
-                    lines.append("            _default")
-                } else {
-                    lines.append("            _arguments -s \\")
-                    for (index, opt) in opts.enumerated() {
-                        let sep = index < opts.count - 1 ? " \\" : ""
-                        lines.append("                \(opt)\(sep)")
-                    }
-                }
-            }
-            lines.append("            ;;")
-        }
-        lines.append("        *)")
-        lines.append("            _default")
-        lines.append("            ;;")
-        lines.append("        esac")
-        lines.append("        ;;")
-        lines.append("    esac")
-        lines.append("}")
-        lines.append("")
-        lines.append("compdef _peekaboo peekaboo")
-        return lines.joined(separator: "\n")
-    }
-
-    private static func collectZshOptions(descriptor: CommanderCommandDescriptor) -> [String] {
-        var opts: [String] = []
-        let sig = descriptor.metadata.signature
-
-        for flag in sig.flags {
-            guard let longName = self.primaryLong(flag.names) else { continue }
-            let help = self.escapeForShell(flag.help ?? "")
-            let shortChar = self.primaryShort(flag.names)
-            if let shortChar {
-                opts.append("'(-\(shortChar) --\(longName))'{\\ -\(shortChar),--\(longName)}'[\(help)]'")
-            } else {
-                opts.append("'--\(longName)[\(help)]'")
-            }
-        }
-
-        for option in sig.options {
-            guard let longName = self.primaryLong(option.names) else { continue }
-            let help = self.escapeForShell(option.help ?? "")
-            let shortChar = self.primaryShort(option.names)
-            if let shortChar {
-                opts.append(
-                    "'(-\(shortChar) --\(longName))'{\\ -\(shortChar),--\(longName)}'[\(help)]:value:'"
-                )
-            } else {
-                opts.append("'--\(longName)[\(help)]:value:'")
-            }
-        }
-
-        // Global flags
-        opts.append("'--help[Show help information]'")
-        return opts
-    }
-
-    // MARK: - Bash
-
-    private static func generateBashScript(descriptors: [CommanderCommandDescriptor]) -> String {
-        var lines: [String] = []
-        lines.append("# Bash completion for peekaboo – generated by `peekaboo completions bash`")
-        lines.append("")
-
-        // Collect all command names
-        let commandNames = descriptors.map(\.metadata.name).sorted()
-
-        // Build subcommand maps
-        var subcommandMap: [String: [String]] = [:]
-        var optionMap: [String: [String]] = [:]
-        for descriptor in descriptors {
-            let name = descriptor.metadata.name
-            if !descriptor.subcommands.isEmpty {
-                subcommandMap[name] = descriptor.subcommands.map(\.metadata.name).sorted()
-            }
-            optionMap[name] = self.collectBashOptions(descriptor: descriptor)
-
-            // Also map subcommand options
-            for sub in descriptor.subcommands {
-                let key = "\(name)_\(sub.metadata.name)"
-                optionMap[key] = self.collectBashOptions(descriptor: sub)
-            }
-        }
-
-        lines.append("_peekaboo() {")
-        lines.append("    local cur prev words cword")
-        lines.append("    _init_completion || return")
-        lines.append("")
-        lines.append("    local commands=\"\(commandNames.joined(separator: " "))\"")
-        lines.append("")
-
-        // Build subcommand variables
-        for (cmd, subs) in subcommandMap.sorted(by: { $0.key < $1.key }) {
-            let varName = "subcmds_\(cmd.replacingOccurrences(of: "-", with: "_"))"
-            lines.append("    local \(varName)=\"\(subs.joined(separator: " "))\"")
-        }
-        lines.append("")
-
-        lines.append("    # Complete the first argument (command)")
-        lines.append("    if [[ $cword -eq 1 ]]; then")
-        lines.append("        COMPREPLY=($(compgen -W \"$commands\" -- \"$cur\"))")
-        lines.append("        return")
-        lines.append("    fi")
-        lines.append("")
-        lines.append("    local cmd=\"${words[1]}\"")
-        lines.append("")
-
-        // Handle subcommand completion
-        lines.append("    # Complete subcommands at position 2")
-        lines.append("    if [[ $cword -eq 2 ]]; then")
-        lines.append("        case \"$cmd\" in")
-        for (cmd, subs) in subcommandMap.sorted(by: { $0.key < $1.key }) {
-            let varName = "subcmds_\(cmd.replacingOccurrences(of: "-", with: "_"))"
-            lines.append("            \(cmd))")
-            lines.append("                if [[ \"$cur\" == -* ]]; then")
-            let opts = optionMap[cmd] ?? []
-            lines.append("                    COMPREPLY=($(compgen -W \"\(opts.joined(separator: " "))\" -- \"$cur\"))")
-            lines.append("                else")
-            lines.append("                    COMPREPLY=($(compgen -W \"$\(varName)\" -- \"$cur\"))")
-            lines.append("                fi")
-            lines.append("                return")
-            lines.append("                ;;")
-        }
-        lines.append("        esac")
-        lines.append("    fi")
-        lines.append("")
-
-        // Handle option completion
-        lines.append("    # Complete options for commands")
-        lines.append("    if [[ \"$cur\" == -* ]]; then")
-        lines.append("        local opts=\"\"")
-        lines.append("        case \"$cmd\" in")
-        for descriptor in descriptors.sorted(by: { $0.metadata.name < $1.metadata.name }) {
-            let name = descriptor.metadata.name
-            let opts = optionMap[name] ?? []
-            if !opts.isEmpty {
-                lines.append("            \(name))")
-                if !descriptor.subcommands.isEmpty {
-                    // Check if there's a subcommand at position 2
-                    lines.append("                if [[ $cword -ge 3 ]]; then")
-                    lines.append("                    local subcmd=\"${words[2]}\"")
-                    lines.append("                    case \"$subcmd\" in")
-                    for sub in descriptor.subcommands.sorted(by: { $0.metadata.name < $1.metadata.name }) {
-                        let subKey = "\(name)_\(sub.metadata.name)"
-                        let subOpts = optionMap[subKey] ?? []
-                        if !subOpts.isEmpty {
-                            lines.append("                        \(sub.metadata.name))")
-                            lines.append(
-                                "                            opts=\"\(subOpts.joined(separator: " "))\""
-                            )
-                            lines.append("                            ;;")
-                        }
-                    }
-                    lines.append("                    esac")
-                    lines.append("                else")
-                    lines.append("                    opts=\"\(opts.joined(separator: " "))\"")
-                    lines.append("                fi")
-                } else {
-                    lines.append("                opts=\"\(opts.joined(separator: " "))\"")
-                }
-                lines.append("                ;;")
-            }
-        }
-        lines.append("        esac")
-        lines.append("        COMPREPLY=($(compgen -W \"$opts\" -- \"$cur\"))")
-        lines.append("        return")
-        lines.append("    fi")
-        lines.append("}")
-        lines.append("")
-        lines.append("complete -F _peekaboo peekaboo")
-        return lines.joined(separator: "\n")
-    }
-
-    private static func collectBashOptions(descriptor: CommanderCommandDescriptor) -> [String] {
-        var opts: [String] = []
-        let sig = descriptor.metadata.signature
-
-        for flag in sig.flags {
-            if let longName = self.primaryLong(flag.names) {
-                opts.append("--\(longName)")
-            }
-            if let shortChar = self.primaryShort(flag.names) {
-                opts.append("-\(shortChar)")
-            }
-        }
-
-        for option in sig.options {
-            if let longName = self.primaryLong(option.names) {
-                opts.append("--\(longName)")
-            }
-            if let shortChar = self.primaryShort(option.names) {
-                opts.append("-\(shortChar)")
-            }
-        }
-
-        opts.append("--help")
-        return opts
-    }
-
-    // MARK: - Fish
-
-    private static func generateFishScript(descriptors: [CommanderCommandDescriptor]) -> String {
-        var lines: [String] = []
-        lines.append("# Fish completion for peekaboo – generated by `peekaboo completions fish`")
-        lines.append("")
-        lines.append("# Disable file completions by default")
-        lines.append("complete -c peekaboo -f")
-        lines.append("")
-
-        // Top-level command completions
-        lines.append("# Commands")
-        for descriptor in descriptors.sorted(by: { $0.metadata.name < $1.metadata.name }) {
-            let desc = self.escapeForShell(descriptor.metadata.abstract)
-            lines.append(
-                "complete -c peekaboo -n '__fish_use_subcommand' -a '\(descriptor.metadata.name)' -d '\(desc)'"
-            )
-        }
-        lines.append("")
-
-        // Subcommand and option completions
-        for descriptor in descriptors.sorted(by: { $0.metadata.name < $1.metadata.name }) {
-            let cmdName = descriptor.metadata.name
-            let condition = "__fish_seen_subcommand_from \(cmdName)"
-
-            // Subcommands
-            if !descriptor.subcommands.isEmpty {
-                lines.append("# \(cmdName) subcommands")
-                for sub in descriptor.subcommands.sorted(by: { $0.metadata.name < $1.metadata.name }) {
-                    let desc = self.escapeForShell(sub.metadata.abstract)
-                    lines.append(
-                        "complete -c peekaboo -n '\(condition)' -a '\(sub.metadata.name)' -d '\(desc)'"
-                    )
-                }
-            }
-
-            // Options and flags for the command
-            let sig = descriptor.metadata.signature
-            if !sig.flags.isEmpty || !sig.options.isEmpty {
-                lines.append("# \(cmdName) options")
-                self.appendFishOptions(
-                    lines: &lines, sig: sig, condition: condition
-                )
-            }
-
-            // Options for subcommands
-            for sub in descriptor.subcommands {
-                let subSig = sub.metadata.signature
-                if !subSig.flags.isEmpty || !subSig.options.isEmpty {
-                    let subCondition = "__fish_seen_subcommand_from \(sub.metadata.name)"
-                    lines.append("# \(cmdName) \(sub.metadata.name) options")
-                    self.appendFishOptions(
-                        lines: &lines, sig: subSig, condition: subCondition
-                    )
-                }
-            }
-            lines.append("")
-        }
-
-        return lines.joined(separator: "\n")
-    }
-
-    private static func appendFishOptions(
-        lines: inout [String],
-        sig: CommandSignature,
-        condition: String
-    ) {
-        for flag in sig.flags {
-            guard let longName = self.primaryLong(flag.names) else { continue }
-            let desc = self.escapeForShell(flag.help ?? "")
-            let shortChar = self.primaryShort(flag.names)
-            var parts = "complete -c peekaboo -n '\(condition)' -l '\(longName)'"
-            if let shortChar {
-                parts += " -s '\(shortChar)'"
-            }
-            parts += " -d '\(desc)'"
-            lines.append(parts)
-        }
-
-        for option in sig.options {
-            guard let longName = self.primaryLong(option.names) else { continue }
-            let desc = self.escapeForShell(option.help ?? "")
-            let shortChar = self.primaryShort(option.names)
-            var parts = "complete -c peekaboo -n '\(condition)' -l '\(longName)' -r"
-            if let shortChar {
-                parts += " -s '\(shortChar)'"
-            }
-            parts += " -d '\(desc)'"
-            lines.append(parts)
-        }
-    }
-
-    // MARK: - Helpers
-
-    private static func primaryLong(_ names: [CommanderName]) -> String? {
-        for name in names {
-            if case let .long(value) = name {
-                return value
-            }
-        }
-        return nil
-    }
-
-    private static func primaryShort(_ names: [CommanderName]) -> Character? {
-        for name in names {
-            if case let .short(value) = name {
-                return value
-            }
-        }
-        return nil
-    }
-
-    private static func escapeForShell(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "'", with: "'\\''")
+        Self.Shell.parse(ProcessInfo.processInfo.environment["SHELL"]) ?? .zsh
     }
 }
 

@@ -5,186 +5,200 @@ import Testing
 
 @Suite("CompletionsCommand")
 struct CompletionsCommandTests {
-    // MARK: - Shell Detection
+    // MARK: - Shell Resolution
 
-    @Test("Detect zsh as default")
+    @Test("Auto-detect defaults to zsh when SHELL is unsupported")
     func detectDefaultZsh() {
-        // detectShell() uses the SHELL environment variable. When SHELL is
-        // set to something non-bash/non-fish (or is absent), zsh is the
-        // documented default. We verify the current environment produces a
-        // valid shell and that the mapping is consistent.
-        let shell = CompletionsCommand.detectShell()
-        let shellEnv = ProcessInfo.processInfo.environment["SHELL"] ?? ""
-        if shellEnv.contains("bash") {
-            #expect(shell == .bash)
-        } else if shellEnv.contains("fish") {
-            #expect(shell == .fish)
-        } else {
-            #expect(shell == .zsh, "Default shell should be zsh when SHELL is not bash or fish")
+        #expect(CompletionsCommand.Shell.parse(nil) == nil)
+        #expect(CompletionsCommand.Shell.parse("/bin/unknown-shell") == nil)
+        #expect(CompletionsCommand.detectShell() == (CompletionsCommand.Shell.parse(
+            ProcessInfo.processInfo.environment["SHELL"]
+        ) ?? .zsh))
+    }
+
+    @Test("Explicit shell names and paths resolve")
+    func resolveExplicitShell() throws {
+        var command = CompletionsCommand()
+        command.shell = "bash"
+        #expect(try command.resolveShell() == .bash)
+
+        command.shell = "/bin/zsh"
+        #expect(try command.resolveShell() == .zsh)
+
+        command.shell = "/opt/homebrew/bin/fish"
+        #expect(try command.resolveShell() == .fish)
+
+        command.shell = "/usr/local/bin/bash5"
+        #expect(try command.resolveShell() == .bash)
+
+        command.shell = "/bin/bash-old"
+        #expect(try command.resolveShell() == .bash)
+
+        command.shell = "/bin/zsh-5.8"
+        #expect(try command.resolveShell() == .zsh)
+
+        command.shell = "/bin/-bash"
+        #expect(try command.resolveShell() == .bash)
+
+        command.shell = "/bin/bash-"
+        #expect(try command.resolveShell() == .bash)
+    }
+
+    @Test("Unsupported explicit shell throws validation error")
+    func invalidShellThrows() {
+        var command = CompletionsCommand()
+        command.shell = "nushell"
+
+        #expect(throws: ValidationError.self) {
+            _ = try command.resolveShell()
         }
     }
 
-    @Test("Resolve explicit shell argument")
-    func resolveExplicitShell() {
-        var cmd = CompletionsCommand()
-        cmd.shell = "bash"
-        #expect(cmd.resolveShell() == .bash)
+    // MARK: - Metadata Extraction
 
-        cmd.shell = "zsh"
-        #expect(cmd.resolveShell() == .zsh)
-
-        cmd.shell = "fish"
-        #expect(cmd.resolveShell() == .fish)
+    @Test("Document is generated from Commander descriptors")
+    func documentContainsRegisteredCommands() {
+        let document = CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors())
+        #expect(document.commandName == "peekaboo")
+        #expect(document.commands.contains(where: { $0.name == "click" }))
+        #expect(document.commands.contains(where: { $0.name == "completions" }))
+        #expect(document.commands.contains(where: { $0.name == "help" }))
     }
 
-    @Test("Resolve shell ignores case")
-    func resolveShellCaseInsensitive() {
-        var cmd = CompletionsCommand()
-        cmd.shell = "ZSH"
-        #expect(cmd.resolveShell() == .zsh)
-
-        cmd.shell = "Bash"
-        #expect(cmd.resolveShell() == .bash)
-
-        cmd.shell = "FISH"
-        #expect(cmd.resolveShell() == .fish)
+    @Test("Help mirror follows the command tree")
+    func helpMirrorContainsNestedCommands() {
+        let document = CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors())
+        let help = try #require(document.commands.first(where: { $0.name == "help" }))
+        let capture = try #require(help.subcommands.first(where: { $0.name == "capture" }))
+        #expect(capture.subcommands.contains(where: { $0.name == "live" }))
     }
 
-    @Test("Resolve falls back to detect when argument is invalid")
-    func resolveInvalidFallsBackToDetect() {
-        var cmd = CompletionsCommand()
-        cmd.shell = "powershell"
-        let resolved = cmd.resolveShell()
-        // "powershell" is not a valid Shell case, so resolveShell() falls back
-        // to detectShell() which returns a value based on $SHELL.
-        let expected = CompletionsCommand.detectShell()
-        #expect(resolved == expected)
+    @Test("Aliases from Commander metadata are preserved")
+    func aliasesArePreserved() {
+        let document = CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors())
+        let clickPath = try #require(document.flattenedPaths.first(where: { $0.path == ["click"] }))
+        let names = Set(clickPath.options.flatMap(\.names))
+
+        #expect(names.contains("--json"))
+        #expect(names.contains("--json-output"))
+        #expect(names.contains("--jsonOutput"))
+        #expect(names.contains("-j"))
     }
 
-    // MARK: - Zsh Script Generation
+    @Test("Argument choice metadata is generated from source types")
+    func argumentChoiceMetadata() throws {
+        let document = CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors())
+        let completionsPath = try #require(document.flattenedPaths.first(where: { $0.path == ["completions"] }))
+        let shellArgument = try #require(completionsPath.arguments.first)
+        let values = shellArgument.choices.map(\.value)
 
-    @Test("Zsh script contains compdef directive")
-    func zshContainsCompdef() {
-        let script = CompletionsCommand.generateScript(for: .zsh)
-        #expect(script.contains("compdef _peekaboo peekaboo"))
+        #expect(values == ["zsh", "bash", "fish"])
+    }
+
+    @Test("Root options include help and version")
+    func rootOptions() {
+        let document = CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors())
+        let names = Set(document.rootOptions.flatMap(\.names))
+
+        #expect(names.contains("--help"))
+        #expect(names.contains("-h"))
+        #expect(names.contains("--version"))
+        #expect(names.contains("-V"))
+    }
+
+    // MARK: - Script Rendering
+
+    @Test("Bash script uses self-contained helper functions")
+    func bashScriptShape() {
+        let script = CompletionScriptRenderer.render(
+            document: CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors()),
+            for: .bash
+        )
+
+        #expect(script.contains("__peekaboo_bash_subcommands"))
+        #expect(script.contains("__peekaboo_bash_options"))
+        #expect(script.contains("__peekaboo_bash_argument_values"))
+        #expect(script.contains("complete -F __peekaboo_bash_complete peekaboo"))
+        #expect(!script.contains("_init_completion"))
+    }
+
+    @Test("Zsh script uses compdef and dynamic helpers")
+    func zshScriptShape() {
+        let script = CompletionScriptRenderer.render(
+            document: CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors()),
+            for: .zsh
+        )
+
         #expect(script.contains("#compdef peekaboo"))
+        #expect(script.contains("__peekaboo_zsh_subcommands"))
+        #expect(script.contains("__peekaboo_zsh_compadd_with_help"))
+        #expect(script.contains("compdef _peekaboo peekaboo"))
     }
 
-    @Test("Zsh script includes command names")
-    func zshIncludesCommandNames() {
-        let script = CompletionsCommand.generateScript(for: .zsh)
-        #expect(script.contains("'capture:"))
-        #expect(script.contains("'click:"))
-        #expect(script.contains("'completions:"))
+    @Test("Fish script uses dynamic completion function")
+    func fishScriptShape() {
+        let script = CompletionScriptRenderer.render(
+            document: CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors()),
+            for: .fish
+        )
+
+        #expect(script.contains("function __peekaboo_fish_complete"))
+        #expect(script.contains("commandline -opc"))
+        #expect(script.contains("complete -c peekaboo -f -a '(__peekaboo_fish_complete)'"))
     }
 
-    @Test("Zsh script includes subcommand functions")
-    func zshIncludesSubcommandFunctions() {
-        let script = CompletionsCommand.generateScript(for: .zsh)
-        // Commands with subcommands should have helper functions
-        #expect(script.contains("_peekaboo_capture()"))
+    @Test("Scripts include shell argument completions")
+    func scriptContainsShellChoices() {
+        let bash = CompletionScriptRenderer.render(
+            document: CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors()),
+            for: .bash
+        )
+        #expect(bash.contains("zsh"))
+        #expect(bash.contains("bash"))
+        #expect(bash.contains("fish"))
     }
 
-    // MARK: - Bash Script Generation
+    @Test("Scripts include global runtime flag aliases")
+    func scriptContainsRuntimeAliases() {
+        let zsh = CompletionScriptRenderer.render(
+            document: CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors()),
+            for: .zsh
+        )
 
-    @Test("Bash script contains complete directive")
-    func bashContainsComplete() {
-        let script = CompletionsCommand.generateScript(for: .bash)
-        #expect(script.contains("complete -F _peekaboo peekaboo"))
+        #expect(zsh.contains("--json-output"))
+        #expect(zsh.contains("--log-level"))
+        #expect(zsh.contains("--verbose"))
     }
 
-    @Test("Bash script includes command names")
-    func bashIncludesCommandNames() {
-        let script = CompletionsCommand.generateScript(for: .bash)
-        #expect(script.contains("capture"))
-        #expect(script.contains("click"))
-        #expect(script.contains("completions"))
+    @Test("Scripts include curated option value choices")
+    func scriptContainsOptionValueChoices() {
+        let bash = CompletionScriptRenderer.render(
+            document: CompletionScriptDocument.make(descriptors: CommanderRegistryBuilder.buildDescriptors()),
+            for: .bash
+        )
+
+        #expect(bash.contains("trace"))
+        #expect(bash.contains("warning"))
+        #expect(bash.contains("critical"))
     }
 
-    @Test("Bash script uses _init_completion")
-    func bashUsesInitCompletion() {
-        let script = CompletionsCommand.generateScript(for: .bash)
-        #expect(script.contains("_init_completion"))
-    }
+    // MARK: - Binding and Registration
 
-    // MARK: - Fish Script Generation
-
-    @Test("Fish script contains complete directives")
-    func fishContainsComplete() {
-        let script = CompletionsCommand.generateScript(for: .fish)
-        #expect(script.contains("complete -c peekaboo"))
-    }
-
-    @Test("Fish script includes command names with descriptions")
-    func fishIncludesCommandNames() {
-        let script = CompletionsCommand.generateScript(for: .fish)
-        #expect(script.contains("__fish_use_subcommand"))
-        #expect(script.contains("-a 'capture'"))
-        #expect(script.contains("-a 'click'"))
-    }
-
-    @Test("Fish script disables file completions")
-    func fishDisablesFileCompletions() {
-        let script = CompletionsCommand.generateScript(for: .fish)
-        #expect(script.contains("complete -c peekaboo -f"))
-    }
-
-    // MARK: - Commander Binding
-
-    @Test("Binder maps shell positional argument")
+    @Test("Binder maps optional shell argument")
     func binderMapsShellArgument() throws {
-        let parsed = ParsedValues(positional: ["zsh"], options: [:], flags: [])
+        let parsed = ParsedValues(positional: ["/bin/zsh"], options: [:], flags: [])
         let command = try CommanderCLIBinder.instantiateCommand(
             ofType: CompletionsCommand.self,
             parsedValues: parsed
         )
-        #expect(command.shell == "zsh")
+        #expect(command.shell == "/bin/zsh")
     }
 
-    @Test("Binder handles missing shell argument")
-    func binderHandlesMissingArgument() throws {
-        let parsed = ParsedValues(positional: [], options: [:], flags: [])
-        let command = try CommanderCLIBinder.instantiateCommand(
-            ofType: CompletionsCommand.self,
-            parsedValues: parsed
-        )
-        #expect(command.shell == nil)
-    }
-
-    // MARK: - Command Registration
-
-    @Test("Completions command is registered in CommandRegistry")
+    @Test("Completions command is registered")
     func commandIsRegistered() {
         let definitions = CommandRegistry.definitions()
         let completions = definitions.first { $0.name == "completions" }
         #expect(completions != nil)
         #expect(completions?.category == .core)
-        #expect(completions?.abstract == "Generate shell completion scripts")
-    }
-
-    // MARK: - Script Content Validation
-
-    @Test("Generated scripts are non-empty for all shells")
-    func allShellsProduceOutput() {
-        for shell in [CompletionsCommand.Shell.zsh, .bash, .fish] {
-            let script = CompletionsCommand.generateScript(for: shell)
-            #expect(!script.isEmpty, "Script for \(shell) should not be empty")
-            #expect(script.count > 100, "Script for \(shell) should have substantial content")
-        }
-    }
-
-    @Test("Zsh script includes option completions for click")
-    func zshIncludesClickOptions() {
-        let script = CompletionsCommand.generateScript(for: .zsh)
-        #expect(script.contains("--double"))
-        #expect(script.contains("--snapshot"))
-    }
-
-    @Test("Global flags appear in completions")
-    func globalFlagsIncluded() {
-        let script = CompletionsCommand.generateScript(for: .bash)
-        #expect(script.contains("--verbose"))
-        #expect(script.contains("--json"))
-        #expect(script.contains("--help"))
     }
 }
